@@ -1,97 +1,119 @@
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE OverloadedStrings #-}
-
 module Hadolint.Formatter.Checkstyle
-    ( printResult
-    , formatResult
-    ) where
+  ( printResults,
+    formatResult,
+  )
+where
 
+import qualified Control.Foldl as Foldl
 import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Lazy.Char8 as B
-import Data.Char
-import Data.Foldable (toList)
-import Data.List (groupBy)
-import Data.Monoid ((<>), mconcat)
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit, ord)
 import qualified Data.Text as Text
+import Data.Text.Encoding (encodeUtf8Builder)
 import Hadolint.Formatter.Format
-import Hadolint.Rules (Metadata(..), RuleCheck(..))
-import ShellCheck.Interface
-import Text.Megaparsec (Stream)
+  ( Result (..),
+    errorBundlePretty,
+    errorPosition,
+    severityText,
+  )
+import Hadolint.Rule (CheckFailure (..), DLSeverity (..), RuleCode (..))
+import System.IO (stdout)
+import Text.Megaparsec (TraversableStream)
 import Text.Megaparsec.Error
-import Text.Megaparsec.Pos (sourceColumn, sourceLine, sourceName, unPos)
+  ( ParseErrorBundle,
+    ShowErrorComponent,
+  )
+import Text.Megaparsec.Pos (sourceColumn, sourceLine, unPos)
+import Text.Megaparsec.Stream (VisualStream)
 
 data CheckStyle = CheckStyle
-    { file :: String
-    , line :: Int
-    , column :: Int
-    , impact :: String
-    , msg :: String
-    , source :: String
-    }
+  { line :: Int,
+    column :: Int,
+    impact :: Text.Text,
+    msg :: Text.Text,
+    source :: Text.Text
+  }
 
-errorToCheckStyle :: (Stream s, ShowErrorComponent e) => ParseErrorBundle s e -> CheckStyle
+errorToCheckStyle :: (VisualStream s, TraversableStream s, ShowErrorComponent e) => ParseErrorBundle s e -> CheckStyle
 errorToCheckStyle err =
-    CheckStyle
-        { file = sourceName pos
-        , line = unPos (sourceLine pos)
-        , column = unPos (sourceColumn pos)
-        , impact = severityText ErrorC
-        , msg = errorBundlePretty err
-        , source = "DL1000"
-        }
+  CheckStyle
+    { line = unPos (sourceLine pos),
+      column = unPos (sourceColumn pos),
+      impact = severityText DLErrorC,
+      msg = Text.pack (errorBundlePretty err),
+      source = "DL1000"
+    }
   where
     pos = errorPosition err
 
-ruleToCheckStyle :: RuleCheck -> CheckStyle
-ruleToCheckStyle RuleCheck {..} =
-    CheckStyle
-        { file = Text.unpack filename
-        , line = linenumber
-        , column = 1
-        , impact = severityText (severity metadata)
-        , msg = Text.unpack (message metadata)
-        , source = Text.unpack (code metadata)
-        }
+ruleToCheckStyle :: CheckFailure -> CheckStyle
+ruleToCheckStyle CheckFailure {..} =
+  CheckStyle
+    { line = line,
+      column = 1,
+      impact = severityText severity,
+      msg = message,
+      source = unRuleCode code
+    }
 
-toXml :: [CheckStyle] -> Builder.Builder
-toXml checks = wrap fileName (foldMap convert checks)
-  where
-    wrap name innerNode = "<file " <> attr "name" name <> ">" <> innerNode <> "</file>"
-    convert CheckStyle {..} =
-        "<error " <> -- Beging the node construction
-        attr "line" (show line) <>
-        attr "column" (show column) <>
-        attr "severity" impact <>
-        attr "message" msg <>
-        attr "source" source <>
-        "/>"
-    fileName =
-        case checks of
-            [] -> ""
-            h:_ -> file h
+toXml :: CheckStyle -> Builder.Builder
+toXml CheckStyle {..} =
+  "<error "
+    <> attr "line" (Builder.intDec line)
+    <> attr "column" (Builder.intDec column)
+    <> attr "severity" (encode impact)
+    <> attr "message" (encode msg)
+    <> attr "source" (encode source)
+    <> "/>"
 
-attr :: String -> String -> Builder.Builder
-attr name value = Builder.string8 name <> "='" <> Builder.string8 (escape value) <> "' "
+encode :: Text.Text -> Builder.Builder
+encode = encodeUtf8Builder . escape
 
-escape :: String -> String
-escape = concatMap doEscape
+attr :: Text.Text -> Builder.Builder -> Builder.Builder
+attr name value = encodeUtf8Builder name <> "='" <> value <> "' "
+
+escape :: Text.Text -> Text.Text
+escape = Text.concatMap doEscape
   where
     doEscape c =
-        if isOk c
-            then [c]
-            else "&#" ++ show (ord c) ++ ";"
+      if isOk c
+        then Text.singleton c
+        else "&#" <> Text.pack (show (ord c)) <> ";"
     isOk x = any (\check -> check x) [isAsciiUpper, isAsciiLower, isDigit, (`elem` [' ', '.', '/'])]
 
-formatResult :: (Stream s, ShowErrorComponent e) => Result s e -> Builder.Builder
-formatResult (Result errors checks) =
-    "<?xml version='1.0' encoding='UTF-8'?><checkstyle version='4.3'>" <> xmlBody <> "</checkstyle>"
+formatResult :: (VisualStream s, TraversableStream s, ShowErrorComponent e) => Result s e -> Maybe FilePath -> Builder.Builder
+formatResult (Result filename errors checks) filePathInReport = header <> xmlBody <> footer
   where
-    xmlBody = mconcat xmlChunks
-    xmlChunks = fmap toXml (groupBy sameFileName flatten)
-    flatten = toList $ checkstyleErrors <> checkstyleChecks
+    xmlBody = Foldl.fold (Foldl.premap toXml Foldl.mconcat) issues
+
+    issues = checkstyleErrors <> checkstyleChecks
     checkstyleErrors = fmap errorToCheckStyle errors
     checkstyleChecks = fmap ruleToCheckStyle checks
-    sameFileName CheckStyle {file = f1} CheckStyle {file = f2} = f1 == f2
 
-printResult :: (Stream s, ShowErrorComponent e) => Result s e -> IO ()
-printResult result = B.putStr (Builder.toLazyByteString (formatResult result))
+    isEmpty = null checks && null errors
+    name = if null filePathInReport then filename else getFilePath filePathInReport
+    header =
+      if isEmpty
+        then ""
+        else "<file " <> attr "name" (encode name) <> ">"
+    footer = if isEmpty then "" else "</file>"
+
+printResults ::
+  (Foldable f, VisualStream s, TraversableStream s, ShowErrorComponent e) =>
+  f (Result s e) -> Maybe FilePath ->
+  IO ()
+printResults results filePathInReport = do
+  B.putStr header
+  mapM_ put results
+  B.putStr footer
+  where
+    header = "<?xml version='1.0' encoding='UTF-8'?><checkstyle version='4.3'>"
+    footer = "</checkstyle>"
+    put result = Builder.hPutBuilder stdout (formatResult result filePathInReport)
+
+getFilePath :: Maybe FilePath -> Text.Text 
+getFilePath Nothing = ""
+getFilePath (Just filePath) = toText [filePath]
+
+toText :: [FilePath] -> Text.Text 
+toText = foldMap Text.pack

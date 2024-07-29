@@ -2,36 +2,56 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Hadolint.Formatter.TTY
-    ( printResult
-    , formatError
-    , formatChecks
-    ) where
+  ( printResults,
+    formatCheck,
+    formatError,
+  )
+where
 
-import Data.Semigroup ((<>))
+import Colourista
+import qualified Control.Foldl as Foldl
 import qualified Data.Text as Text
 import Hadolint.Formatter.Format
-import Hadolint.Rules
+import Hadolint.Rule (CheckFailure (..), DLSeverity (..), RuleCode (..))
 import Language.Docker.Syntax
-import Text.Megaparsec (Stream(..))
+import Text.Megaparsec (TraversableStream)
 import Text.Megaparsec.Error
+import Text.Megaparsec.Stream (VisualStream)
 
-formatErrors :: (Stream s, ShowErrorComponent e, Functor f) => f (ParseErrorBundle s e) -> f String
-formatErrors = fmap formatError
-
-formatError :: (Stream s, ShowErrorComponent e) => ParseErrorBundle s e -> String
+formatError :: (VisualStream s, TraversableStream s, ShowErrorComponent e) => ParseErrorBundle s e -> String
 formatError err = stripNewlines (errorMessageLine err)
 
-formatChecks :: Functor f => f RuleCheck -> f Text.Text
-formatChecks = fmap formatCheck
-  where
-    formatCheck (RuleCheck meta source line _) =
-        formatPos source line <> code meta <> " " <> message meta
+formatCheck :: Bool -> Text.Text -> CheckFailure -> Text.Text
+formatCheck nocolor source CheckFailure {code, severity, line, message} =
+  formatPos source line
+    <> unRuleCode code
+    <> " "
+    <> ( if nocolor
+           then severityText severity
+           else colorizedSeverity severity
+       )
+    <> ": "
+    <> message
 
 formatPos :: Filename -> Linenumber -> Text.Text
 formatPos source line = source <> ":" <> Text.pack (show line) <> " "
 
-printResult :: (Stream s, ShowErrorComponent e) => Result s e -> IO ()
-printResult Result {errors, checks} = printErrors >> printChecks
+printResults ::
+  (VisualStream s, TraversableStream s, ShowErrorComponent e, Foldl.Foldable f) =>
+  f (Result s e) ->
+  Bool ->
+  IO ()
+printResults results color = mapM_ printResult results
   where
-    printErrors = mapM_ putStrLn (formatErrors errors)
-    printChecks = mapM_ (putStrLn . Text.unpack) (formatChecks checks)
+    printResult Result {fileName, errors, checks} = printErrors errors >> printChecks fileName checks
+    printErrors errors = mapM_ (putStrLn . formatError) errors
+    printChecks fileName checks = mapM_ (putStrLn . Text.unpack . formatCheck color fileName) checks
+
+colorizedSeverity :: DLSeverity -> Text.Text
+colorizedSeverity s =
+  case s of
+    DLErrorC -> formatWith [bold, red] $ severityText s
+    DLWarningC -> formatWith [bold, yellow] $ severityText s
+    DLInfoC -> formatWith [green] $ severityText s
+    DLStyleC -> formatWith [cyan] $ severityText s
+    _ -> severityText s

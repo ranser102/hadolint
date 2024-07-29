@@ -1,101 +1,139 @@
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE DeriveGeneric #-}
-
 module Hadolint.Formatter.Codeclimate
-    ( printResult
-    , formatResult
-    ) where
+  ( printResults,
+    printGitLabResults,
+    formatResult,
+    formatGitLabResult,
+  )
+where
 
+import qualified Control.Foldl as Foldl
+import Crypto.Hash (Digest, SHA1 (..), hash)
 import Data.Aeson hiding (Result)
 import qualified Data.ByteString.Lazy as B
-import Data.Monoid ((<>))
 import Data.Sequence (Seq)
 import qualified Data.Text as Text
 import GHC.Generics
-import Hadolint.Formatter.Format (Result(..), errorPosition)
-import Hadolint.Rules (Metadata(..), RuleCheck(..))
-import ShellCheck.Interface
-import Text.Megaparsec (Stream)
+import Hadolint.Formatter.Format (Result (..), errorPosition)
+import Hadolint.Rule (CheckFailure (..), DLSeverity (..), RuleCode (..))
+import Text.Megaparsec (TraversableStream)
 import Text.Megaparsec.Error
 import Text.Megaparsec.Pos (sourceColumn, sourceLine, sourceName, unPos)
+import Text.Megaparsec.Stream (VisualStream)
 
 data Issue = Issue
-    { checkName :: String
-    , description :: String
-    , location :: Location
-    , impact :: String
-    }
+  { checkName :: Text.Text,
+    description :: Text.Text,
+    location :: Location,
+    impact :: Text.Text
+  }
+
+data FingerprintIssue = FingerprintIssue
+  { issue :: Issue,
+    fingerprint :: Digest SHA1
+  }
 
 data Location
-    = LocLine String
-              Int
-    | LocPos String
-             Pos
+  = LocLine
+      Text.Text
+      Int
+  | LocPos
+      Text.Text
+      Pos
 
 instance ToJSON Location where
-    toJSON (LocLine path l) = object ["path" .= path, "lines" .= object ["begin" .= l, "end" .= l]]
-    toJSON (LocPos path pos) =
-        object ["path" .= path, "positions" .= object ["begin" .= pos, "end" .= pos]]
+  toJSON (LocLine path l) = object ["path" .= path, "lines" .= object ["begin" .= l, "end" .= l]]
+  toJSON (LocPos path pos) =
+    object ["path" .= path, "positions" .= object ["begin" .= pos, "end" .= pos]]
 
 data Pos = Pos
-    { line :: Int
-    , column :: Int
-    } deriving (Generic)
+  { line :: Int,
+    column :: Int
+  }
+  deriving (Generic)
 
 instance ToJSON Pos
 
 instance ToJSON Issue where
-    toJSON Issue {..} =
-        object
-            [ "type" .= ("issue" :: String)
-            , "check_name" .= checkName
-            , "description" .= description
-            , "categories" .= (["Bug Risk"] :: [String])
-            , "location" .= location
-            , "severity" .= impact
-            ]
+  toJSON Issue {..} =
+    object
+      [ "type" .= ("issue" :: Text.Text),
+        "check_name" .= checkName,
+        "description" .= description,
+        "categories" .= (["Bug Risk"] :: [Text.Text]),
+        "location" .= location,
+        "severity" .= impact
+      ]
 
-errorToIssue :: (Stream s, ShowErrorComponent e) => ParseErrorBundle s e -> Issue
+instance ToJSON FingerprintIssue where
+  toJSON FingerprintIssue {..} =
+    object
+      [ "type" .= ("issue" :: Text.Text),
+        "fingerprint" .= show fingerprint,
+        "check_name" .= checkName issue,
+        "description" .= description issue,
+        "categories" .= (["Bug Risk"] :: [Text.Text]),
+        "location" .= location issue,
+        "severity" .= impact issue
+      ]
+
+errorToIssue :: (VisualStream s, TraversableStream s, ShowErrorComponent e) => ParseErrorBundle s e -> Issue
 errorToIssue err =
-    Issue
-        { checkName = "DL1000"
-        , description = errorBundlePretty err
-        , location = LocPos (sourceName pos) Pos {..}
-        , impact = severityText ErrorC
-        }
+  Issue
+    { checkName = "DL1000",
+      description = Text.pack $ errorBundlePretty err,
+      location = LocPos (Text.pack $ sourceName pos) Pos {..},
+      impact = severityText DLErrorC
+    }
   where
     pos = errorPosition err
     line = unPos (sourceLine pos)
     column = unPos (sourceColumn pos)
 
-checkToIssue :: RuleCheck -> Issue
-checkToIssue RuleCheck {..} =
-    Issue
-        { checkName = Text.unpack (code metadata)
-        , description = Text.unpack (message metadata)
-        , location = LocLine (Text.unpack filename) linenumber
-        , impact = severityText (severity metadata)
-        }
+checkToIssue :: Text.Text -> CheckFailure -> Issue
+checkToIssue fileName CheckFailure {..} =
+  Issue
+    { checkName = unRuleCode code,
+      description = message,
+      location = LocLine fileName line,
+      impact = severityText severity
+    }
 
-severityText :: Severity -> String
+severityText :: DLSeverity -> Text.Text
 severityText severity =
-    case severity of
-        ErrorC -> "blocker"
-        WarningC -> "major"
-        InfoC -> "info"
-        StyleC -> "minor"
+  case severity of
+    DLErrorC -> "blocker"
+    DLWarningC -> "major"
+    DLInfoC -> "info"
+    DLStyleC -> "minor"
+    _ -> ""
 
-formatResult :: (Stream s, ShowErrorComponent e) => Result s e -> Seq Issue
-formatResult (Result errors checks) = allIssues
-  where
-    allIssues = errorMessages <> checkMessages
-    errorMessages = fmap errorToIssue errors
-    checkMessages = fmap checkToIssue checks
+generateFingerprint :: Issue -> Digest SHA1
+generateFingerprint = hash . B.toStrict . encode
 
-printResult :: (Stream s, ShowErrorComponent e) => Result s e -> IO ()
+issueToFingerprintIssue :: Issue -> FingerprintIssue
+issueToFingerprintIssue i =
+  FingerprintIssue
+    { issue = i,
+      fingerprint = generateFingerprint i
+    }
+
+formatResult :: (VisualStream s, TraversableStream s, ShowErrorComponent e) => Result s e -> Seq Issue
+formatResult (Result filename errors checks) = (errorToIssue <$> errors) <> (checkToIssue filename <$> checks)
+
+formatGitLabResult :: (VisualStream s, TraversableStream s, ShowErrorComponent e) => Result s e -> Seq FingerprintIssue
+formatGitLabResult result = issueToFingerprintIssue <$> formatResult result
+
+printResult :: (VisualStream s, TraversableStream s, ShowErrorComponent e) => Result s e -> IO ()
 printResult result = mapM_ output (formatResult result)
   where
     output value = do
-        B.putStr (encode value)
-        B.putStr (B.singleton 0x00)
+      B.putStr (encode value)
+      B.putStr (B.singleton 0x00)
+
+printResults :: (VisualStream s, TraversableStream s, ShowErrorComponent e, Foldable f) => f (Result s e) -> IO ()
+printResults = mapM_ printResult
+
+printGitLabResults :: (Foldable f, VisualStream s, TraversableStream s, ShowErrorComponent e) => f (Result s e) -> IO ()
+printGitLabResults results = B.putStr . encode $ flattened
+  where
+    flattened = Foldl.fold (Foldl.premap formatGitLabResult Foldl.mconcat) results

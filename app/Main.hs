@@ -1,122 +1,93 @@
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE NamedFieldPuns #-}
-
 module Main where
 
-import Control.Applicative
+import Control.Monad (when)
+import Data.Default
+import Hadolint (OutputFormat (..), printResults, DLSeverity (..))
+import Hadolint.Config
+import Prettyprinter
 import qualified Data.List.NonEmpty as NonEmpty
-import Data.Semigroup ((<>))
-import qualified Data.Set as Set
-import Data.String
-import qualified Data.Version
-import qualified Development.GitRev
-import Options.Applicative hiding (ParseError)
-import qualified Paths_hadolint -- version from hadolint.cabal file
-import System.Exit (exitFailure, exitSuccess)
-
+import qualified Data.Sequence as Seq
 import qualified Hadolint
+import qualified Hadolint.Rule as Rule
+import Options.Applicative
+  ( execParser,
+    fullDesc,
+    header,
+    helper,
+    info,
+    progDesc
+  )
+-- version from hadolint.cabal file
+import System.Exit (exitFailure, exitSuccess)
+import System.IO (hPrint, stderr)
 
-data CommandOptions = CommandOptions
-    { showVersion :: Bool
-    , configFile :: Maybe FilePath
-    , format :: Hadolint.OutputFormat
-    , dockerfiles :: [String]
-    , lintingOptions :: Hadolint.LintOptions
-    }
 
-toOutputFormat :: String -> Maybe Hadolint.OutputFormat
-toOutputFormat "json" = Just Hadolint.Json
-toOutputFormat "tty" = Just Hadolint.TTY
-toOutputFormat "codeclimate" = Just Hadolint.CodeclimateJson
-toOutputFormat "checkstyle" = Just Hadolint.Checkstyle
-toOutputFormat "codacy" = Just Hadolint.Codacy
-toOutputFormat _ = Nothing
+noFailure :: Hadolint.Result s e -> DLSeverity -> Bool
+noFailure (Hadolint.Result _ Seq.Empty Seq.Empty) _ = True
+noFailure (Hadolint.Result _ Seq.Empty fails) cutoff =
+  Seq.null (Seq.filter (\f -> Rule.severity f <= cutoff) fails)
+noFailure _ _ = False
 
-showFormat :: Hadolint.OutputFormat -> String
-showFormat Hadolint.Json = "json"
-showFormat Hadolint.TTY = "tty"
-showFormat Hadolint.CodeclimateJson = "codeclimate"
-showFormat Hadolint.Checkstyle = "checkstyle"
-showFormat Hadolint.Codacy = "codacy"
+exitProgram ::
+  Foldable f =>
+  Configuration ->
+  f (Hadolint.Result s e) ->
+  IO ()
+exitProgram conf res
+  | noFail conf = exitSuccess
+  | CodeclimateJson == format conf = exitSuccess
+  | Codacy == format conf = exitSuccess
+  | all (`noFailure` failureThreshold conf) res = exitSuccess
+  | otherwise = exitFailure
 
-parseOptions :: Parser CommandOptions
-parseOptions =
-    CommandOptions <$> -- CLI options parser definition
-    version <*>
-    configFile <*>
-    outputFormat <*>
-    files <*>
-    lintOptions
-  where
-    version = switch (long "version" <> short 'v' <> help "Show version")
-    --
-    -- | Parse the config filename to use
-    configFile =
-        optional
-            (strOption
-                 (long "config" <> short 'c' <> metavar "FILENAME" <>
-                  help "Path to the configuration file"))
-    --
-    -- | Parse the output format option
-    outputFormat =
-        option
-            (maybeReader toOutputFormat)
-            (long "format" <> -- options for the output format
-             short 'f' <>
-             help
-                 "The output format for the results [tty | json | checkstyle | codeclimate | codacy]" <>
-             value Hadolint.TTY <> -- The default value
-             showDefaultWith showFormat <>
-             completeWith ["tty", "json", "checkstyle", "codeclimate", "codacy"])
-    --
-    -- | Parse a list of ignored rules
-    ignoreList =
-        many
-            (strOption
-                 (long "ignore" <>
-                  help "A rule to ignore. If present, the ignore list in the config file is ignored" <>
-                  metavar "RULECODE"))
-    --
-    -- | Parse a list of dockerfile names
-    files = many (argument str (metavar "DOCKERFILE..." <> action "file"))
-    --
-    -- | Parse the rule ignore list and the rules configuration into a LintOptions
-    lintOptions = Hadolint.LintOptions <$> ignoreList <*> parseRulesConfig
-    --
-    -- | Parse all the optional rules configuration
-    parseRulesConfig =
-        Hadolint.RulesConfig . Set.fromList . fmap fromString <$>
-        many
-            (strOption
-                 (long "trusted-registry" <>
-                  help "A docker registry to allow to appear in FROM instructions" <>
-                  metavar "REGISTRY (e.g. docker.io)"))
+runLint ::
+  CommandlineConfig ->
+  Configuration ->
+  IO ()
+runLint cmd conf = do
+  let files = NonEmpty.fromList $ dockerfiles cmd
+      filePathInReport = filePathInReportOption cmd
+  res <- Hadolint.lintIO conf files
+  printResults (format conf) (noColor conf) filePathInReport res
+  exitProgram conf res
+
+execute :: CommandlineConfig -> Configuration -> IO ()
+execute CommandlineConfig {showVersion = True} _ =
+  putStrLn Hadolint.getVersion >> exitSuccess
+execute CommandlineConfig {dockerfiles = []} _ =
+  putStrLn "Please provide a Dockerfile" >> exitFailure
+execute cmd config = runLint cmd config
+
 
 main :: IO ()
 main = do
-    cmd <- execParser opts
-    execute cmd
-  where
-    execute CommandOptions {showVersion = True} = putStrLn getVersion >> exitSuccess
-    execute CommandOptions {dockerfiles = []} =
-        putStrLn "Please provide a Dockerfile" >> exitFailure
-    execute cmd = do
-        lintConfig <- Hadolint.applyConfig (configFile cmd) (lintingOptions cmd)
-        let files = NonEmpty.fromList (dockerfiles cmd)
-        case lintConfig of
-            Left err -> error err
-            Right conf -> do
-                res <- Hadolint.lint conf files
-                Hadolint.printResultsAndExit (format cmd) res
-    opts =
-        info
-            (helper <*> parseOptions)
-            (fullDesc <> progDesc "Lint Dockerfile for errors and best practices" <>
-             header "hadolint - Dockerfile Linter written in Haskell")
+  invokedWith <- execParser opts
+  fromEnvironment <- getConfigFromEnvironment
+  let fromCommandline = configuration invokedWith
+  eitherFromConfigfile <- getConfigFromFile
+    (configFile invokedWith) (Just True == partialVerbose fromCommandline)
+  fromConfigfile <- getConfigFromEither eitherFromConfigfile
 
-getVersion :: String
-getVersion
-    | $(Development.GitRev.gitDescribe) == "UNKNOWN" =
-        "Haskell Dockerfile Linter " ++ Data.Version.showVersion Paths_hadolint.version ++ "-no-git"
-    | otherwise = "Haskell Dockerfile Linter " ++ $(Development.GitRev.gitDescribe)
+  let runningConfig =
+        applyPartialConfiguration
+          def
+          ( fromEnvironment <> fromConfigfile <> fromCommandline )
+
+  when (verbose runningConfig) (hPrint stderr (pretty runningConfig))
+  execute invokedWith runningConfig
+  where
+    opts =
+      info
+        ( helper <*> parseCommandline )
+        ( fullDesc
+            <> header "hadolint - Dockerfile Linter written in Haskell"
+            <> progDesc "Lint Dockerfile for errors and best practices"
+        )
+
+    -- Either return the config or print the error message
+    getConfigFromEither ei =
+      case ei of
+        Left err -> do
+          hPrint stderr err
+          return mempty
+        Right conf -> return conf
